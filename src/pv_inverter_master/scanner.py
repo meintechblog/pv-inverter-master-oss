@@ -1,0 +1,457 @@
+"""Network scanner for discovering SunSpec-compatible inverters on the LAN.
+
+Performs a two-phase scan:
+1. TCP port probe -- fast async connection test on Modbus ports
+2. SunSpec verification -- reads SunSpec header and Common Block via Modbus
+
+Exports: detect_subnet, scan_subnet, ScanConfig, DiscoveredDevice, decode_string
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess
+from dataclasses import dataclass, field
+from ipaddress import IPv4Address, IPv4Network
+from typing import Callable
+
+import aiohttp
+import structlog
+
+from pv_inverter_master.modbus_gateway import (
+    GatewayError,
+    get_gateway,
+    is_host_claimed,
+    prune_idle_gateways,
+)
+
+log = structlog.get_logger()
+
+# SunSpec magic number: "SunS" as two uint16 registers
+SUNSPEC_MAGIC = [0x5375, 0x6E53]
+SUNSPEC_HEADER_ADDR = 40000
+COMMON_BLOCK_ADDR = 40002
+COMMON_BLOCK_COUNT = 67  # DID + Length + 65 data registers
+
+
+def decode_string(registers: list[int]) -> str:
+    """Decode uint16 register list to ASCII string, stripping nulls."""
+    raw = b"".join(r.to_bytes(2, "big") for r in registers)
+    return raw.decode("ascii", errors="replace").rstrip("\x00").strip()
+
+
+@dataclass
+class ScanConfig:
+    """Configuration for network scan."""
+
+    ports: list[int] = field(default_factory=lambda: [502, 1502])
+    tcp_timeout: float = 0.5
+    modbus_timeout: float = 2.0
+    concurrency: int = 15
+    scan_unit_ids: list[int] = field(default_factory=lambda: [1])
+    skip_ips: set[str] = field(default_factory=set)
+
+
+@dataclass
+class DiscoveredDevice:
+    """A device found during scanning (SunSpec or OpenDTU)."""
+
+    ip: str
+    port: int
+    unit_id: int
+    manufacturer: str
+    model: str
+    serial_number: str
+    firmware_version: str
+    device_type: str = "solaredge"  # "solaredge" or "opendtu"
+    already_added: bool = False     # True = this IP is already a configured device
+
+    @property
+    def supported(self) -> bool:
+        """True if this device is a supported inverter type."""
+        return (
+            "solaredge" in self.manufacturer.lower()
+            or self.device_type == "opendtu"
+        )
+
+
+def detect_subnet() -> IPv4Network:
+    """Auto-detect the local subnet from the first non-loopback, non-link-local interface.
+
+    Uses `ip -j -4 addr show` to enumerate network interfaces.
+    Raises RuntimeError if no usable interface is found.
+    """
+    result = subprocess.run(
+        ["ip", "-j", "-4", "addr", "show"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    interfaces = json.loads(result.stdout)
+
+    for iface in interfaces:
+        for addr_info in iface.get("addr_info", []):
+            ip_str = addr_info.get("local", "")
+            prefix = addr_info.get("prefixlen", 24)
+            try:
+                ip = IPv4Address(ip_str)
+            except ValueError:
+                continue
+            # Skip loopback (127.x.x.x)
+            if ip.is_loopback:
+                continue
+            # Skip link-local (169.254.x.x)
+            if ip.is_link_local:
+                continue
+            return IPv4Network(f"{ip_str}/{prefix}", strict=False)
+
+    raise RuntimeError("No usable network interface found for subnet detection")
+
+
+async def _probe_modbus_port(ip: str, port: int, timeout: float) -> bool:
+    """TCP port check on a possible Modbus host - through the host's gateway.
+
+    The claim is re-checked under the host lock at probe time (a device may have
+    been started since the host list was built). A claimed, quiesced or busy
+    host counts as "not open": the scanner never opens a session next to one.
+    """
+    try:
+        return await get_gateway(ip).tcp_probe(port, timeout=timeout, wait_timeout=2.0)
+    except GatewayError:
+        return False
+
+
+async def _probe_port(ip: str, port: int, timeout: float) -> bool:
+    """Test whether a NON-Modbus TCP port (HTTP/80) is open on the given IP.
+
+    Returns True if connection succeeds within timeout, False otherwise.
+    """
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port),
+            timeout=timeout,
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
+async def _verify_sunspec(
+    ip: str, port: int, unit_id: int, timeout: float
+) -> DiscoveredDevice | None:
+    """Verify SunSpec magic number and read Common Block identity.
+
+    Returns DiscoveredDevice if valid SunSpec device, None otherwise.
+    """
+    # A configured device's host is off limits: its single Modbus session
+    # belongs to the plugin, a scanner session would be the "second client"
+    # that wedges the SE30K. (scan_subnet already filters these out; this is
+    # the second line of defence for direct callers.)
+    if is_host_claimed(ip):
+        return None
+    gateway = get_gateway(ip)
+    try:
+        # probe_transaction = lock-guarded, one temporary session, closed on exit.
+        async with gateway.probe_transaction(
+            port, timeout=timeout, retries=0, wait_timeout=2.0, refuse_claimed=True,
+        ) as t:
+            # Read SunSpec header (2 registers at 40000)
+            header = await t.read_holding(SUNSPEC_HEADER_ADDR, 2, unit_id)
+            if header.isError():
+                return None
+            if header.registers != SUNSPEC_MAGIC:
+                return None
+
+            # Read Common Block (67 registers at 40002)
+            common = await t.read_holding(COMMON_BLOCK_ADDR, COMMON_BLOCK_COUNT, unit_id)
+            if common.isError():
+                return None
+
+        regs = common.registers
+        # Validate Common Block structure
+        did = regs[0]
+        length = regs[1]
+        if did != 1 or length != 65:
+            log.warning("scanner.invalid_common_block", ip=ip, did=did, length=length)
+            return None
+
+        manufacturer = decode_string(regs[2:18])
+        model = decode_string(regs[18:34])
+        firmware = decode_string(regs[42:50])
+        serial = decode_string(regs[50:66])
+
+        return DiscoveredDevice(
+            ip=ip,
+            port=port,
+            unit_id=unit_id,
+            manufacturer=manufacturer,
+            model=model,
+            serial_number=serial,
+            firmware_version=firmware,
+        )
+
+    except Exception:
+        log.debug("scanner.verify_failed", ip=ip, port=port)
+        return None
+
+
+def parse_subnet_override(value: str) -> IPv4Network:
+    """Parse a user-supplied subnet/CIDR string for the scanner.
+
+    Accepts:
+      - Full CIDR: "192.0.2.0/24"
+      - Single IP shorthand: "192.0.2.101" -> /24 around that IP
+      - "192.0.2.x" / "192.0.2.*" -> "192.0.2.0/24"
+
+    Always returns a strict=False IPv4Network so a host bit in the input
+    doesn't raise. Caps the network size at /22 (1024 hosts) to avoid
+    accidental large scans over VPN.
+    """
+    raw = value.strip()
+    if not raw:
+        raise ValueError("empty subnet")
+    # "192.0.2.x" or "192.0.2.*" -> .0/24
+    last = raw.rsplit(".", 1)[-1] if "." in raw else ""
+    if last in ("x", "X", "*"):
+        head = raw.rsplit(".", 1)[0]
+        raw = f"{head}.0/24"
+    # Single IP -> /24
+    if "/" not in raw:
+        raw = f"{raw}/24"
+    network = IPv4Network(raw, strict=False)
+    if network.prefixlen < 22:
+        raise ValueError(
+            f"subnet too large (got /{network.prefixlen}, min /22 = 1024 hosts)"
+        )
+    return network
+
+
+async def scan_subnet(
+    config: ScanConfig | None = None,
+    progress_callback: Callable | None = None,
+    subnet_override: str | None = None,
+) -> list[DiscoveredDevice]:
+    """Scan a subnet for SunSpec-compatible inverters and OpenDTU gateways.
+
+    Phase 1: TCP probe all hosts on configured ports (concurrent, bounded by semaphore).
+    Phase 2: Verify SunSpec on hosts with open ports.
+    Phase 3: HTTP probe for OpenDTU gateways across all hosts.
+
+    Args:
+        config: Scan configuration. Uses defaults if None.
+        progress_callback: Optional callback(phase, current, total) for progress updates.
+        subnet_override: Optional CIDR (e.g. "192.0.2.0/24") or shorthand
+            ("192.0.2.x", "192.0.2.101") to scan a remote subnet —
+            useful for VPN-reachable networks. Falls back to local subnet
+            auto-detection when None or empty.
+
+    Returns:
+        List of discovered SunSpec devices.
+    """
+    if config is None:
+        config = ScanConfig()
+
+    if subnet_override:
+        subnet = parse_subnet_override(subnet_override)
+    else:
+        subnet = detect_subnet()
+    all_hosts = [str(ip) for ip in subnet.hosts()]
+    # Hosts a configured device plugin owns are NOT touched on the Modbus ports:
+    # neither the raw TCP probe nor a SunSpec read may open a second session to
+    # a single-session inverter (SE30K wedge). Other already-configured IPs
+    # (HTTP/virtual devices) are still scanned - results carry an
+    # ``already_added`` flag so the UI greys them out instead of hiding them.
+    modbus_hosts = [h for h in all_hosts if not is_host_claimed(h)]
+
+    log.info("scan.start", subnet=str(subnet), host_count=len(modbus_hosts), ports=config.ports)
+
+    # Phase 1: TCP port probe
+    semaphore = asyncio.Semaphore(config.concurrency)
+    open_hosts: list[tuple[str, int]] = []
+    total_probes = len(modbus_hosts) * len(config.ports)
+    probe_count = 0
+
+    async def probe_host(ip: str) -> list[tuple[str, int, bool]]:
+        # One task per HOST: its ports are probed one after the other (never
+        # two sessions to one host at once); hosts run concurrently.
+        out: list[tuple[str, int, bool]] = []
+        async with semaphore:
+            for port in config.ports:
+                out.append((ip, port, await _probe_modbus_port(ip, port, config.tcp_timeout)))
+        return out
+
+    tasks = [probe_host(ip) for ip in modbus_hosts]
+
+    for coro in asyncio.as_completed(tasks):
+        for ip, port, is_open in await coro:
+            probe_count += 1
+            if progress_callback:
+                progress_callback("probe", probe_count, total_probes)
+            if is_open:
+                open_hosts.append((ip, port))
+
+    log.info("scan.probe_complete", open_count=len(open_hosts))
+
+    # Phase 2: SunSpec verification
+    devices: list[DiscoveredDevice] = []
+    verify_total = len(open_hosts) * len(config.scan_unit_ids)
+    verify_count = 0
+
+    for ip, port in open_hosts:
+        for unit_id in config.scan_unit_ids:
+            verify_count += 1
+            if progress_callback:
+                progress_callback("verify", verify_count, verify_total)
+            device = await _verify_sunspec(ip, port, unit_id, config.modbus_timeout)
+            if device:
+                log.info(
+                    "scan.device_found",
+                    ip=ip, port=port, unit_id=unit_id,
+                    manufacturer=device.manufacturer, model=device.model,
+                )
+                devices.append(device)
+
+    log.info("scan.sunspec_complete", devices_found=len(devices))
+    prune_idle_gateways()  # forget the throw-away gateways of scanned hosts
+
+    # Phase 3: OpenDTU HTTP discovery (port 80) — scans ALL hosts, not filtered
+    opendtu_devices = await _scan_opendtu(all_hosts, config, progress_callback)
+    devices.extend(opendtu_devices)
+
+    # Flag devices whose IP is already a configured inverter.
+    for device in devices:
+        device.already_added = device.ip in config.skip_ips
+
+    log.info("scan.complete", devices_found=len(devices))
+    return devices
+
+
+async def _check_opendtu_with_session(
+    ip: str, session: "aiohttp.ClientSession"
+) -> list[DiscoveredDevice]:
+    """Check if an IP hosts an OpenDTU instance and discover its inverters.
+
+    OpenDTU exposes /api/system/status and /api/livedata/status.
+    Each OpenDTU can manage multiple Hoymiles micro-inverters.
+    Returns one DiscoveredDevice per Hoymiles inverter found.
+    """
+    devices = []
+    try:
+        # Check if this is an OpenDTU
+        async with session.get(f"http://{ip}/api/system/status") as resp:
+            if resp.status != 200:
+                return []
+            sys_data = await resp.json()
+
+        # Verify it's actually OpenDTU
+        hostname = sys_data.get("hostname", "")
+        if "opendtu" not in hostname.lower() and "dtu" not in hostname.lower():
+            # Try checking module field
+            module = sys_data.get("git_hash", "")
+            if not module:
+                return []
+
+        # Get live inverter data
+        async with session.get(f"http://{ip}/api/livedata/status") as resp:
+            if resp.status != 200:
+                return []
+            live_data = await resp.json()
+
+        for inv in live_data.get("inverters", []):
+            serial = str(inv.get("serial", ""))
+            name = inv.get("name", serial)
+            producing = inv.get("producing", False)
+            reachable = inv.get("reachable", False)
+
+            # Get limit info
+            limit_abs = inv.get("limit_absolute", 0)
+
+            devices.append(DiscoveredDevice(
+                ip=ip,
+                port=80,
+                unit_id=0,  # Not applicable for OpenDTU
+                manufacturer="Hoymiles",
+                model=name,
+                serial_number=serial,
+                firmware_version=f"OpenDTU@{ip}",
+                device_type="opendtu",
+            ))
+
+            log.info(
+                "scan.opendtu_inverter_found",
+                ip=ip,
+                serial=serial,
+                name=name,
+                reachable=reachable,
+                producing=producing,
+                rated_power=limit_abs,
+            )
+
+    except Exception as exc:
+        log.debug("scanner.opendtu_check_failed", ip=ip, error=str(exc))
+
+    return devices
+
+
+# Backward-compat wrapper for standalone usage
+async def _check_opendtu(ip: str, timeout: float) -> list[DiscoveredDevice]:
+    """Standalone check — creates its own session."""
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as session:
+        return await _check_opendtu_with_session(ip, session)
+
+
+async def _scan_opendtu(
+    hosts: list[str],
+    config: ScanConfig,
+    progress_callback: Callable | None = None,
+) -> list[DiscoveredDevice]:
+    """Scan all hosts for OpenDTU instances on port 80.
+
+    Uses a SINGLE shared aiohttp session for all checks to avoid
+    connection pool conflicts when running inside the webapp event loop.
+    """
+    # First probe port 80 on all hosts
+    semaphore = asyncio.Semaphore(config.concurrency)
+    http_hosts: list[str] = []
+
+    async def probe_http(ip: str) -> tuple[str, bool]:
+        async with semaphore:
+            result = await _probe_port(ip, 80, config.tcp_timeout)
+            return ip, result
+
+    tasks = [probe_http(ip) for ip in hosts]
+    for coro in asyncio.as_completed(tasks):
+        ip, is_open = await coro
+        if is_open:
+            http_hosts.append(ip)
+
+    if not http_hosts:
+        return []
+
+    log.info("scan.opendtu_probe_complete", http_open=len(http_hosts))
+
+    # Check HTTP hosts concurrently with a shared session
+    all_devices: list[DiscoveredDevice] = []
+    sem = asyncio.Semaphore(10)
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=5.0),  # ESP32 can be slow
+        connector=aiohttp.TCPConnector(limit=10, force_close=True),
+    ) as session:
+
+        async def check_with_sem(ip: str) -> list[DiscoveredDevice]:
+            async with sem:
+                return await _check_opendtu_with_session(ip, session)
+
+        tasks = [check_with_sem(ip) for ip in http_hosts]
+        for coro in asyncio.as_completed(tasks):
+            try:
+                devices = await coro
+                all_devices.extend(devices)
+            except Exception as exc:
+                log.debug("scanner.opendtu_batch_error", error=str(exc))
+
+    return all_devices

@@ -1,0 +1,25 @@
+[Unit]
+Description=PV-Inverter-Proxy Hourly Anomaly Detector
+Documentation=https://github.com/meintechblog/pv-inverter-master-oss
+After=network-online.target
+Wants=network-online.target
+# Activated by pv-inverter-anomaly.timer — NO [Install] section (the timer
+# owns scheduling, same pattern as the updater.service).
+
+[Service]
+Type=oneshot
+User=pv-proxy
+Group=pv-proxy
+ExecStart=/opt/pv-inverter-master/.venv/bin/python3 -m pv_inverter_master.monitoring.anomaly_detector
+# Production enable: the detector defaults escalation+push notifications OFF in code
+# (safe for dev/manual runs). These env vars are what make the deployed timer
+# actually send notifications. Dev runs without these stay silent.
+# Set PV_ANOMALY_WEBHOOK_BASE_URL to the notification receiver's base URL.
+Environment=PV_ANOMALY_PUSH=1
+Environment=PV_ANOMALY_ESCALATION=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/pv-inverter-master /var/lib/pv-inverter-master
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pv-inverter-anomaly

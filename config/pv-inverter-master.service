@@ -1,0 +1,39 @@
+[Unit]
+Description=PV-Inverter-Master (Multi-Source Solar Aggregator for Venus OS)
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+[Service]
+Type=exec
+ExecStart=/opt/pv-inverter-master/.venv/bin/python3 -m pv_inverter_master
+Restart=on-failure
+RestartSec=5
+# 90 s: stop drain (<= 40 s) + gateway close (hard limit 60 s) must never be
+# cut short by SIGKILL - a FIN in the middle of a transaction wedges the SE30K.
+TimeoutStopSec=90
+KillMode=mixed
+User=pv-proxy
+Group=pv-proxy
+# Optional GitHub auth for the update-check poll. Since the repo went
+# private (2026-06-04) the /releases/latest API 404s without auth, so the
+# scheduler needs a token. Drop `GITHUB_TOKEN=ghp_...` into this file
+# (chmod 600, owned by pv-proxy) — the leading `-` makes it optional so a
+# box without the file still boots. Secret stays OUT of git (the file is
+# created box-side, not shipped). NOTE: the actual code download
+# (`git fetch origin` against the private HTTPS remote) authenticates via
+# git's own credential layer, not this env var — provision that box-side
+# too (credential helper or token-in-remote).
+EnvironmentFile=-/etc/pv-inverter-master/updater.env
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/pv-inverter-master /var/lib/pv-inverter-master
+RuntimeDirectory=pv-inverter-master
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pv-inverter-master
+
+[Install]
+WantedBy=multi-user.target

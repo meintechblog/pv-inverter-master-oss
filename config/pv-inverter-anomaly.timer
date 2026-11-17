@@ -1,0 +1,11 @@
+[Unit]
+Description=PV-Inverter-Proxy Hourly Anomaly Detector Timer
+Documentation=https://github.com/meintechblog/pv-inverter-master-oss
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=pv-inverter-anomaly.service
+
+[Install]
+WantedBy=timers.target

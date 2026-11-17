@@ -1,0 +1,30 @@
+[project]
+name = "pv-inverter-master"
+version = "8.9.0"
+description = "Multi-inverter proxy aggregating SolarEdge, OpenDTU, and Shelly devices into a single Fronius-compatible SunSpec endpoint for Venus OS"
+requires-python = ">=3.11"
+dependencies = [
+    "pymodbus>=3.6,<3.13",
+    "structlog>=24.0",
+    "PyYAML>=6.0,<7.0",
+    "aiohttp>=3.10,<4.0",
+    "aiomqtt>=2.3,<3.0",
+    "zeroconf>=0.140,<1.0",
+    "hoymiles-wifi>=0.5.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]

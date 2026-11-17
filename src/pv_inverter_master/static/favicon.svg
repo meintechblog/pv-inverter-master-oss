@@ -1,0 +1,21 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Dark rounded background so the icon stays visible on light browser tab bars -->
+  <rect width="32" height="32" rx="7" fill="#141414"/>
+  <!-- Sun -->
+  <circle cx="16" cy="9" r="4" fill="#F0962E"/>
+  <!-- Sun rays (bold for small-size legibility) -->
+  <g stroke="#F0962E" stroke-width="1.6" stroke-linecap="round">
+    <line x1="16" y1="1.5" x2="16" y2="3"/>
+    <line x1="16" y1="15" x2="16" y2="16.5"/>
+    <line x1="23.5" y1="9" x2="22" y2="9"/>
+    <line x1="10" y1="9" x2="8.5" y2="9"/>
+    <line x1="21.3" y1="3.7" x2="20.2" y2="4.8"/>
+    <line x1="11.8" y1="14.2" x2="10.7" y2="13.1"/>
+    <line x1="10.7" y1="3.7" x2="11.8" y2="4.8"/>
+    <line x1="20.2" y1="14.2" x2="21.3" y2="13.1"/>
+  </g>
+  <!-- Inverter body -->
+  <rect x="5" y="19" width="22" height="9.5" rx="2.5" fill="rgba(56, 125, 197, 0.18)" stroke="#387DC5" stroke-width="1.7"/>
+  <!-- Sine wave inside inverter -->
+  <path d="M8.5 23.8 Q11 20.8, 13.5 23.8 Q16 26.8, 18.5 23.8 Q21 20.8, 23.5 23.8" stroke="#387DC5" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,769 @@
+"""Tests for network scanner module -- TCP port probing and SunSpec verification."""
+from __future__ import annotations
+
+import asyncio
+from ipaddress import IPv4Network
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from pv_inverter_master.sunspec_models import encode_string
+from pv_inverter_master.scanner import (
+    ScanConfig,
+    DiscoveredDevice,
+    decode_string,
+    detect_subnet,
+    _probe_port,
+    _verify_sunspec,
+    scan_subnet,
+)
+
+
+def _make_mock_response(registers, is_error=False):
+    """Create a mock Modbus response."""
+    resp = MagicMock()
+    resp.isError.return_value = is_error
+    resp.registers = registers
+    return resp
+
+
+def _build_common_block(
+    manufacturer="SolarEdge",
+    model="SE30K",
+    firmware="4.18.32",
+    serial="7E1234AB",
+):
+    """Build 67 registers for a SunSpec Common Block."""
+    regs = [0] * 67
+    regs[0] = 1    # DID
+    regs[1] = 65   # Length
+    regs[2:18] = encode_string(manufacturer, 16)
+    regs[18:34] = encode_string(model, 16)
+    # regs[34:42] = options (zeros is fine)
+    regs[42:50] = encode_string(firmware, 8)
+    regs[50:66] = encode_string(serial, 16)
+    # regs[66] = device address (0 is fine)
+    return regs
+
+
+# ── ScanConfig ──────────────────────────────────────────────────
+
+class TestScanConfig:
+    def test_scan_config_defaults(self):
+        cfg = ScanConfig()
+        assert cfg.ports == [502, 1502]
+        assert cfg.tcp_timeout == 0.5
+        assert cfg.modbus_timeout == 2.0
+        assert cfg.concurrency == 15
+        assert cfg.scan_unit_ids == [1]
+        assert cfg.skip_ips == set()
+
+    def test_scan_config_custom(self):
+        cfg = ScanConfig(ports=[502], concurrency=10)
+        assert cfg.ports == [502]
+        assert cfg.concurrency == 10
+
+
+# ── DiscoveredDevice ────────────────────────────────────────────
+
+class TestDiscoveredDevice:
+    def test_discovered_device_fields(self):
+        dev = DiscoveredDevice(
+            ip="192.0.2.18",
+            port=1502,
+            unit_id=1,
+            manufacturer="SolarEdge",
+            model="SE30K",
+            serial_number="ABC123",
+            firmware_version="4.18.32",
+        )
+        assert dev.ip == "192.0.2.18"
+        assert dev.port == 1502
+        assert dev.unit_id == 1
+        assert dev.manufacturer == "SolarEdge"
+        assert dev.model == "SE30K"
+        assert dev.serial_number == "ABC123"
+        assert dev.firmware_version == "4.18.32"
+        assert dev.supported is True  # computed
+
+    def test_supported_flag_solaredge(self):
+        dev = DiscoveredDevice(
+            ip="203.0.113.1", port=502, unit_id=1,
+            manufacturer="SolarEdge", model="SE30K",
+            serial_number="X", firmware_version="1.0",
+        )
+        assert dev.supported is True
+
+    def test_supported_flag_other(self):
+        dev = DiscoveredDevice(
+            ip="203.0.113.2", port=502, unit_id=1,
+            manufacturer="Fronius", model="Symo",
+            serial_number="Y", firmware_version="2.0",
+        )
+        assert dev.supported is False
+
+
+# ── decode_string ───────────────────────────────────────────────
+
+class TestDecodeString:
+    def test_decode_ascii(self):
+        assert decode_string([0x4142, 0x4344]) == "ABCD"
+
+    def test_decode_null_padded(self):
+        assert decode_string([0x4142, 0x0000]) == "AB"
+
+    def test_decode_empty(self):
+        assert decode_string([0x0000]) == ""
+
+
+# ── detect_subnet ──────────────────────────────────────────────
+
+class TestDetectSubnet:
+    def _ip_json(self, interfaces):
+        """Build JSON output like `ip -j -4 addr show`."""
+        import json
+        result = []
+        for name, ip, prefix in interfaces:
+            result.append({
+                "ifname": name,
+                "addr_info": [{"local": ip, "prefixlen": prefix}],
+            })
+        return json.dumps(result)
+
+    @patch("pv_inverter_master.scanner.subprocess.run")
+    def test_detect_subnet_single_interface(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout=self._ip_json([("eth0", "192.0.2.191", 24)]),
+            returncode=0,
+        )
+        result = detect_subnet()
+        assert result == IPv4Network("192.0.2.0/24")
+
+    @patch("pv_inverter_master.scanner.subprocess.run")
+    def test_detect_subnet_skips_loopback(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout=self._ip_json([
+                ("lo", "127.0.0.1", 8),
+                ("eth0", "192.0.2.191", 24),
+            ]),
+            returncode=0,
+        )
+        result = detect_subnet()
+        assert result == IPv4Network("192.0.2.0/24")
+
+    @patch("pv_inverter_master.scanner.subprocess.run")
+    def test_detect_subnet_skips_link_local(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout=self._ip_json([
+                ("avahi", "169.254.1.1", 16),
+                ("eth0", "192.0.2.191", 24),
+            ]),
+            returncode=0,
+        )
+        result = detect_subnet()
+        assert result == IPv4Network("192.0.2.0/24")
+
+    @patch("pv_inverter_master.scanner.subprocess.run")
+    def test_detect_subnet_no_interface(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout=self._ip_json([("lo", "127.0.0.1", 8)]),
+            returncode=0,
+        )
+        with pytest.raises(RuntimeError):
+            detect_subnet()
+
+
+# ── _probe_port ─────────────────────────────────────────────────
+
+class TestProbePort:
+    @pytest.mark.asyncio
+    async def test_probe_port_open(self):
+        mock_writer = MagicMock()
+        mock_writer.close = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
+        with patch("pv_inverter_master.scanner.asyncio.open_connection",
+                    new_callable=AsyncMock, return_value=(MagicMock(), mock_writer)):
+            result = await _probe_port("192.0.2.18", 502, 0.5)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_probe_port_closed(self):
+        with patch("pv_inverter_master.scanner.asyncio.open_connection",
+                    new_callable=AsyncMock, side_effect=OSError("refused")):
+            result = await _probe_port("192.0.2.18", 502, 0.5)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_probe_port_timeout(self):
+        with patch("pv_inverter_master.scanner.asyncio.open_connection",
+                    new_callable=AsyncMock, side_effect=asyncio.TimeoutError):
+            result = await _probe_port("192.0.2.18", 502, 0.5)
+        assert result is False
+
+
+# ── _verify_sunspec ─────────────────────────────────────────────
+
+class TestVerifySunSpec:
+    @pytest.mark.asyncio
+    async def test_verify_sunspec_valid(self):
+        mock_client = AsyncMock()
+        mock_client.connect = AsyncMock()
+        mock_client.close = MagicMock()
+        # First call: SunSpec header
+        header_resp = _make_mock_response([0x5375, 0x6E53])
+        # Second call: Common Block
+        common_resp = _make_mock_response(_build_common_block())
+        mock_client.read_holding_registers = AsyncMock(
+            side_effect=[header_resp, common_resp]
+        )
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=mock_client):
+            result = await _verify_sunspec("192.0.2.18", 1502, 1, 2.0)
+        assert result is not None
+        assert result.manufacturer == "SolarEdge"
+        assert result.model == "SE30K"
+        assert result.serial_number == "7E1234AB"
+        assert result.firmware_version == "4.18.32"
+        assert result.supported is True
+
+    @pytest.mark.asyncio
+    async def test_verify_sunspec_no_magic(self):
+        mock_client = AsyncMock()
+        mock_client.connect = AsyncMock()
+        mock_client.close = MagicMock()
+        header_resp = _make_mock_response([0x0000, 0x0000])
+        mock_client.read_holding_registers = AsyncMock(return_value=header_resp)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=mock_client):
+            result = await _verify_sunspec("192.0.2.18", 1502, 1, 2.0)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_verify_sunspec_read_error(self):
+        mock_client = AsyncMock()
+        mock_client.connect = AsyncMock()
+        mock_client.close = MagicMock()
+        error_resp = _make_mock_response([], is_error=True)
+        mock_client.read_holding_registers = AsyncMock(return_value=error_resp)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=mock_client):
+            result = await _verify_sunspec("192.0.2.18", 1502, 1, 2.0)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_verify_sunspec_connection_fail(self):
+        mock_client = AsyncMock()
+        mock_client.connect = AsyncMock(side_effect=Exception("connection refused"))
+        mock_client.close = MagicMock()
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=mock_client):
+            result = await _verify_sunspec("192.0.2.18", 1502, 1, 2.0)
+        assert result is None
+
+
+class TestScannerRespectsGateway:
+    @pytest.mark.asyncio
+    async def test_verify_skips_host_owned_by_a_device_plugin(self):
+        """A configured SE30K must never get a scanner session."""
+        from pv_inverter_master.modbus_gateway import get_gateway
+
+        get_gateway("192.0.2.18").claim(object())
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient") as MockClient:
+            result = await _verify_sunspec("192.0.2.18", 1502, 1, 2.0)
+        assert result is None
+        MockClient.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scan_subnet_does_not_probe_owned_host(self):
+        from ipaddress import IPv4Network
+        from pv_inverter_master.modbus_gateway import get_gateway
+
+        get_gateway("192.0.2.18").claim(object())
+        subnet = IPv4Network("192.0.2.16/30")  # .17 .18
+        probed: list[str] = []
+
+        async def mock_probe(ip, port, timeout):
+            probed.append(ip)
+            return False
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._scan_opendtu", return_value=[]):
+            await scan_subnet(ScanConfig())
+        assert "192.0.2.18" not in probed
+        assert "192.0.2.17" in probed
+
+
+# ── scan_subnet ─────────────────────────────────────────────────
+
+class TestScanSubnet:
+    @pytest.mark.asyncio
+    async def test_scan_subnet_flags_configured_ips(self):
+        """Already-configured IPs are still scanned and flagged already_added."""
+        cfg = ScanConfig(ports=[1502], skip_ips={"192.0.2.1"})
+        subnet = IPv4Network("192.0.2.0/30")  # hosts: .1, .2
+
+        device = DiscoveredDevice(
+            ip="192.0.2.1", port=1502, unit_id=1,
+            manufacturer="SolarEdge", model="SE30K",
+            serial_number="ABC", firmware_version="1.0",
+        )
+
+        async def mock_probe(ip, port, timeout):
+            return ip == "192.0.2.1"
+
+        async def mock_verify(ip, port, unit_id, timeout):
+            return device if ip == "192.0.2.1" else None
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe) as mock_p, \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._verify_sunspec", side_effect=mock_verify):
+            result = await scan_subnet(cfg)
+
+        # The configured IP is still probed (no longer filtered out)...
+        probed_ips = {call.args[0] for call in mock_p.call_args_list}
+        assert "192.0.2.1" in probed_ips
+        # ...and surfaces in the results flagged already_added.
+        assert len(result) == 1
+        assert result[0].already_added is True
+
+    @pytest.mark.asyncio
+    async def test_scan_subnet_returns_devices(self):
+        cfg = ScanConfig(ports=[1502])
+        subnet = IPv4Network("192.0.2.0/30")  # hosts: .1, .2
+
+        device = DiscoveredDevice(
+            ip="192.0.2.1", port=1502, unit_id=1,
+            manufacturer="SolarEdge", model="SE30K",
+            serial_number="ABC", firmware_version="1.0",
+        )
+
+        async def mock_probe(ip, port, timeout):
+            return ip == "192.0.2.1"
+
+        async def mock_verify(ip, port, unit_id, timeout):
+            if ip == "192.0.2.1":
+                return device
+            return None
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._verify_sunspec", side_effect=mock_verify):
+            result = await scan_subnet(cfg)
+
+        assert len(result) == 1
+        assert result[0].ip == "192.0.2.1"
+
+    @pytest.mark.asyncio
+    async def test_scan_subnet_empty_network(self):
+        cfg = ScanConfig()
+        subnet = IPv4Network("203.0.113.0/30")
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port",
+                   new_callable=AsyncMock, return_value=False), \
+             patch("pv_inverter_master.scanner._probe_port",
+                   new_callable=AsyncMock, return_value=False):
+            result = await scan_subnet(cfg)
+
+        assert result == []
+
+
+# ── Common Block parsing ───────────────────────────────────────
+
+class TestCommonBlockParse:
+    """Validate that _verify_sunspec correctly parses Common Block fields."""
+
+    def _make_client(self, common_regs):
+        """Create a mock Modbus client returning SunSpec header + common block."""
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.close = MagicMock()
+        header_resp = _make_mock_response([0x5375, 0x6E53])
+        common_resp = _make_mock_response(common_regs)
+        client.read_holding_registers = AsyncMock(
+            side_effect=[header_resp, common_resp]
+        )
+        return client
+
+    @pytest.mark.asyncio
+    async def test_parse_manufacturer_solaredge(self):
+        regs = _build_common_block(manufacturer="SolarEdge")
+        client = self._make_client(regs)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is not None
+        assert device.manufacturer == "SolarEdge"
+
+    @pytest.mark.asyncio
+    async def test_parse_model(self):
+        regs = _build_common_block(model="SE30K")
+        client = self._make_client(regs)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is not None
+        assert device.model == "SE30K"
+
+    @pytest.mark.asyncio
+    async def test_parse_serial(self):
+        regs = _build_common_block(serial="7E1234AB")
+        client = self._make_client(regs)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is not None
+        assert device.serial_number == "7E1234AB"
+
+    @pytest.mark.asyncio
+    async def test_parse_firmware(self):
+        regs = _build_common_block(firmware="4.18.32")
+        client = self._make_client(regs)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is not None
+        assert device.firmware_version == "4.18.32"
+
+    @pytest.mark.asyncio
+    async def test_parse_non_solaredge_manufacturer(self):
+        regs = _build_common_block(manufacturer="Fronius")
+        client = self._make_client(regs)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is not None
+        assert device.manufacturer == "Fronius"
+        assert device.supported is False
+
+    @pytest.mark.asyncio
+    async def test_parse_manufacturer_case_insensitive(self):
+        regs = _build_common_block(manufacturer="SOLAREDGE")
+        client = self._make_client(regs)
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is not None
+        assert device.supported is True
+
+    @pytest.mark.asyncio
+    async def test_partial_common_block_error(self):
+        """Valid SunSpec header but Common Block read returns error."""
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        client.close = MagicMock()
+        header_resp = _make_mock_response([0x5375, 0x6E53])
+        error_resp = _make_mock_response([], is_error=True)
+        client.read_holding_registers = AsyncMock(
+            side_effect=[header_resp, error_resp]
+        )
+        with patch("pv_inverter_master.modbus_gateway.AsyncModbusTcpClient",
+                    return_value=client):
+            device = await _verify_sunspec("203.0.113.1", 502, 1, 2.0)
+        assert device is None
+
+
+# ── Unit ID scanning ───────────────────────────────────────────
+
+class TestUnitIdScan:
+    """Validate multi-unit-ID scanning behavior."""
+
+    @pytest.mark.asyncio
+    async def test_default_scans_unit_id_1_only(self):
+        cfg = ScanConfig(ports=[502])
+        subnet = IPv4Network("203.0.113.0/30")  # hosts: .1, .2
+
+        async def mock_probe(ip, port, timeout):
+            return ip == "203.0.113.1"
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._verify_sunspec",
+                   new_callable=AsyncMock, return_value=None) as mock_verify:
+            await scan_subnet(cfg)
+
+        # Default scan_unit_ids=[1], so _verify_sunspec should only be called with unit_id=1
+        unit_ids = [call.args[2] for call in mock_verify.call_args_list]
+        assert unit_ids == [1]
+
+    @pytest.mark.asyncio
+    async def test_extended_scan_unit_ids(self):
+        cfg = ScanConfig(ports=[502], scan_unit_ids=list(range(1, 11)))
+        subnet = IPv4Network("203.0.113.0/30")
+
+        async def mock_probe(ip, port, timeout):
+            return ip == "203.0.113.1"
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._verify_sunspec",
+                   new_callable=AsyncMock, return_value=None) as mock_verify:
+            await scan_subnet(cfg)
+
+        # Should be called 10 times (unit IDs 1-10) for the one open host
+        unit_ids = [call.args[2] for call in mock_verify.call_args_list]
+        assert sorted(unit_ids) == list(range(1, 11))
+
+    @pytest.mark.asyncio
+    async def test_multiple_unit_ids_found(self):
+        cfg = ScanConfig(ports=[502], scan_unit_ids=[1, 2])
+        subnet = IPv4Network("203.0.113.0/30")
+
+        device1 = DiscoveredDevice(
+            ip="203.0.113.1", port=502, unit_id=1,
+            manufacturer="SolarEdge", model="SE30K",
+            serial_number="AAA", firmware_version="1.0",
+        )
+        device2 = DiscoveredDevice(
+            ip="203.0.113.1", port=502, unit_id=2,
+            manufacturer="SolarEdge", model="SE10K",
+            serial_number="BBB", firmware_version="2.0",
+        )
+
+        async def mock_probe(ip, port, timeout):
+            return ip == "203.0.113.1"
+
+        async def mock_verify(ip, port, unit_id, timeout):
+            if ip == "203.0.113.1" and unit_id == 1:
+                return device1
+            if ip == "203.0.113.1" and unit_id == 2:
+                return device2
+            return None
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._verify_sunspec", side_effect=mock_verify):
+            result = await scan_subnet(cfg)
+
+        assert len(result) == 2
+        assert result[0].unit_id == 1
+        assert result[1].unit_id == 2
+
+    @pytest.mark.asyncio
+    async def test_unit_id_no_response(self):
+        cfg = ScanConfig(ports=[502], scan_unit_ids=[1, 2])
+        subnet = IPv4Network("203.0.113.0/30")
+
+        device1 = DiscoveredDevice(
+            ip="203.0.113.1", port=502, unit_id=1,
+            manufacturer="SolarEdge", model="SE30K",
+            serial_number="AAA", firmware_version="1.0",
+        )
+
+        async def mock_probe(ip, port, timeout):
+            return ip == "203.0.113.1"
+
+        async def mock_verify(ip, port, unit_id, timeout):
+            if ip == "203.0.113.1" and unit_id == 1:
+                return device1
+            return None  # unit_id=2 returns no SunSpec
+
+        with patch("pv_inverter_master.scanner.detect_subnet", return_value=subnet), \
+             patch("pv_inverter_master.scanner._probe_modbus_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._probe_port", side_effect=mock_probe), \
+             patch("pv_inverter_master.scanner._verify_sunspec", side_effect=mock_verify):
+            result = await scan_subnet(cfg)
+
+        assert len(result) == 1
+        assert result[0].unit_id == 1
+
+
+# ── Scanner REST API ───────────────────────────────────────────
+
+import time
+import weakref
+
+from aiohttp.test_utils import TestClient, TestServer
+
+from pv_inverter_master.config import Config
+from pv_inverter_master.connection import ConnectionManager
+from pv_inverter_master.control import ControlState, OverrideLog
+from pv_inverter_master.register_cache import RegisterCache
+from pv_inverter_master.sunspec_models import build_initial_registers, DATABLOCK_START
+from pymodbus.datastore import ModbusSequentialDataBlock
+
+
+@pytest.fixture
+async def scanner_client(tmp_path):
+    """Create an aiohttp test client with scanner endpoint."""
+    from pv_inverter_master.webapp import create_webapp
+
+    initial_values = build_initial_registers()
+    datablock = ModbusSequentialDataBlock(DATABLOCK_START, initial_values)
+    cache = RegisterCache(datablock, staleness_timeout=30.0)
+    cache.last_successful_poll = time.monotonic()
+    cache._has_been_updated = True
+
+    conn_mgr = ConnectionManager(poll_interval=1.0)
+
+    shared_ctx = {
+        "cache": cache,
+        "conn_mgr": conn_mgr,
+        "control_state": ControlState(),
+        "override_log": OverrideLog(),
+        "poll_counter": {"success": 50, "total": 55},
+        "last_se_poll": {},
+    }
+
+    config = Config()
+    config.inverter.host = "192.0.2.18"
+    config_path = str(tmp_path / "config.yaml")
+
+    runner = await create_webapp(shared_ctx, config, config_path)
+    app = runner.app
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    yield client
+    await client.close()
+
+
+class TestScannerAPI:
+    """Tests for POST /api/scanner/discover endpoint (background task mode)."""
+
+    @pytest.mark.asyncio
+    async def test_discover_endpoint_returns_started(self, scanner_client):
+        """POST /api/scanner/discover returns {status: started} immediately."""
+        with patch("pv_inverter_master.webapp.routes_discovery.scan_subnet",
+                    new_callable=AsyncMock, return_value=[]):
+            resp = await scanner_client.post("/api/scanner/discover", json={})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "started"
+
+    @pytest.mark.asyncio
+    async def test_discover_concurrent_guard(self, scanner_client):
+        """Second POST while scan running returns 409."""
+        scanner_client.app["_scan_running"] = True
+        resp = await scanner_client.post("/api/scanner/discover", json={})
+        assert resp.status == 409
+        data = await resp.json()
+        assert "already running" in data["error"].lower()
+        scanner_client.app["_scan_running"] = False
+
+    @pytest.mark.asyncio
+    async def test_discover_skips_configured_ip(self, scanner_client):
+        with patch("pv_inverter_master.webapp.routes_discovery.scan_subnet",
+                    new_callable=AsyncMock, return_value=[]) as mock_scan:
+            resp = await scanner_client.post("/api/scanner/discover", json={})
+        assert resp.status == 200
+        # Background task was created; scan_subnet will be called with skip_ips
+        # Since it's a background task, we check the call was scheduled
+        await asyncio.sleep(0.1)  # let background task run
+        if mock_scan.called:
+            call_args = mock_scan.call_args
+            scan_config = call_args[0][0]
+            assert "192.0.2.18" in scan_config.skip_ips
+
+
+# ---------------------------------------------------------------------------
+# parse_subnet_override
+# ---------------------------------------------------------------------------
+
+import pytest
+from ipaddress import IPv4Network
+
+
+@pytest.mark.parametrize("inp,expected", [
+    ("192.0.2.0/24", "192.0.2.0/24"),
+    ("192.0.2.x", "192.0.2.0/24"),
+    ("192.0.2.X", "192.0.2.0/24"),
+    ("192.0.2.*", "192.0.2.0/24"),
+    ("192.0.2.101", "192.0.2.0/24"),
+    ("192.0.0.0/22", "192.0.0.0/22"),
+    ("  192.0.2.0/24  ", "192.0.2.0/24"),
+    # Single host bit set in /24 input is normalized via strict=False.
+    ("192.0.2.101/24", "192.0.2.0/24"),
+])
+def test_parse_subnet_override_accepts(inp, expected):
+    from pv_inverter_master.scanner import parse_subnet_override
+    net = parse_subnet_override(inp)
+    assert net == IPv4Network(expected)
+
+
+@pytest.mark.parametrize("inp", [
+    "",
+    "   ",
+    "not-an-ip",
+    "192.0.2.0/16",  # too large (>1024 hosts)
+    "10.0.0.0/8",       # way too large
+    "999.999.999.999/24",
+])
+def test_parse_subnet_override_rejects(inp):
+    from pv_inverter_master.scanner import parse_subnet_override
+    with pytest.raises((ValueError, Exception)):
+        parse_subnet_override(inp)
+
+
+    @pytest.mark.asyncio
+    async def test_discover_accepts_subnet_override_in_body(self, scanner_client):
+        """POST with body.subnet forwards to scan_subnet via subnet_override.
+
+        Covers the VPN-reachable remote subnet feature: caller specifies
+        e.g. "192.0.2.0/24" and the scan runs against that subnet
+        instead of auto-detecting the local one.
+        """
+        from unittest.mock import AsyncMock, patch
+        with patch("pv_inverter_master.webapp.routes_discovery.scan_subnet",
+                    new_callable=AsyncMock, return_value=[]) as mock_scan:
+            resp = await scanner_client.post(
+                "/api/scanner/discover",
+                json={"subnet": "192.0.2.0/24"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["subnet"] == "192.0.2.0/24"
+            # Give the background task a moment to invoke scan_subnet
+            import asyncio
+            for _ in range(20):
+                if mock_scan.called:
+                    break
+                await asyncio.sleep(0.05)
+            assert mock_scan.called
+            kwargs = mock_scan.await_args.kwargs
+            assert kwargs.get("subnet_override") == "192.0.2.0/24"
+
+    @pytest.mark.asyncio
+    async def test_discover_rejects_invalid_subnet(self, scanner_client):
+        """Invalid subnet input returns 400 instead of silent background failure."""
+        resp = await scanner_client.post(
+            "/api/scanner/discover",
+            json={"subnet": "not-a-valid-cidr"},
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert "Invalid subnet" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_discover_rejects_oversized_subnet(self, scanner_client):
+        """Subnet larger than /22 must be rejected (avoid huge VPN scans)."""
+        resp = await scanner_client.post(
+            "/api/scanner/discover",
+            json={"subnet": "10.0.0.0/8"},
+        )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_discover_omits_subnet_means_auto(self, scanner_client):
+        """When body has no subnet, subnet_override=None reaches scan_subnet."""
+        from unittest.mock import AsyncMock, patch
+        with patch("pv_inverter_master.webapp.routes_discovery.scan_subnet",
+                    new_callable=AsyncMock, return_value=[]) as mock_scan:
+            resp = await scanner_client.post("/api/scanner/discover", json={})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["subnet"] == "auto"
+            import asyncio
+            for _ in range(20):
+                if mock_scan.called:
+                    break
+                await asyncio.sleep(0.05)
+            assert mock_scan.called
+            assert mock_scan.await_args.kwargs.get("subnet_override") is None

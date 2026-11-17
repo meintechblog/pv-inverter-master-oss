@@ -1,0 +1,92 @@
+"""Tests for InverterPlugin ABC and PollResult dataclass."""
+import pytest
+
+
+class TestPollResult:
+    """Verify PollResult dataclass fields and defaults."""
+
+    def test_pollresult_has_common_registers(self):
+        from pv_inverter_master.plugin import PollResult
+        pr = PollResult(common_registers=[0] * 67, inverter_registers=[0] * 52, success=True)
+        assert len(pr.common_registers) == 67
+
+    def test_pollresult_has_inverter_registers(self):
+        from pv_inverter_master.plugin import PollResult
+        pr = PollResult(common_registers=[0] * 67, inverter_registers=[0] * 52, success=True)
+        assert len(pr.inverter_registers) == 52
+
+    def test_pollresult_success_field(self):
+        from pv_inverter_master.plugin import PollResult
+        pr = PollResult(common_registers=[], inverter_registers=[], success=True)
+        assert pr.success is True
+
+    def test_pollresult_error_default_none(self):
+        from pv_inverter_master.plugin import PollResult
+        pr = PollResult(common_registers=[], inverter_registers=[], success=True)
+        assert pr.error is None
+
+    def test_pollresult_error_can_be_set(self):
+        from pv_inverter_master.plugin import PollResult
+        pr = PollResult(common_registers=[], inverter_registers=[], success=False, error="timeout")
+        assert pr.error == "timeout"
+
+
+class TestInverterPluginABC:
+    """Verify InverterPlugin ABC contract."""
+
+    def test_cannot_instantiate_directly(self):
+        from pv_inverter_master.plugin import InverterPlugin
+        with pytest.raises(TypeError):
+            InverterPlugin()
+
+    def test_concrete_subclass_can_instantiate(self):
+        from pv_inverter_master.plugin import InverterPlugin, PollResult, WriteResult, ThrottleCaps
+
+        class DummyPlugin(InverterPlugin):
+            async def connect(self) -> None:
+                pass
+
+            async def poll(self) -> PollResult:
+                return PollResult(common_registers=[], inverter_registers=[], success=True)
+
+            def get_static_common_overrides(self) -> dict[int, int]:
+                return {}
+
+            def get_model_120_registers(self) -> list[int]:
+                return []
+
+            async def write_power_limit(self, enable: bool, limit_pct: float) -> WriteResult:
+                return WriteResult(success=True)
+
+            async def reconfigure(self, host: str, port: int, unit_id: int) -> None:
+                pass
+
+            async def close(self) -> None:
+                pass
+
+            @property
+            def throttle_capabilities(self) -> ThrottleCaps:
+                return ThrottleCaps(mode="none", response_time_s=0.0, cooldown_s=0.0, startup_delay_s=0.0)
+
+        plugin = DummyPlugin()
+        assert plugin is not None
+
+    def test_has_connect_method(self):
+        from pv_inverter_master.plugin import InverterPlugin
+        assert hasattr(InverterPlugin, "connect")
+
+    def test_has_poll_method(self):
+        from pv_inverter_master.plugin import InverterPlugin
+        assert hasattr(InverterPlugin, "poll")
+
+    def test_has_get_static_common_overrides_method(self):
+        from pv_inverter_master.plugin import InverterPlugin
+        assert hasattr(InverterPlugin, "get_static_common_overrides")
+
+    def test_has_get_model_120_registers_method(self):
+        from pv_inverter_master.plugin import InverterPlugin
+        assert hasattr(InverterPlugin, "get_model_120_registers")
+
+    def test_has_close_method(self):
+        from pv_inverter_master.plugin import InverterPlugin
+        assert hasattr(InverterPlugin, "close")

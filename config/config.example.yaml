@@ -1,0 +1,73 @@
+# PV-Inverter-Proxy Configuration
+# Copy to /etc/pv-inverter-master/config.yaml and adjust values.
+
+# Inverter connections (list of SunSpec-compatible inverters)
+inverters:
+  - id: "default00001"
+    host: "192.0.2.18"   # Inverter IP address
+    port: 1502             # Modbus TCP port
+    unit_id: 1             # Modbus unit/slave ID
+    enabled: true          # Set false to skip this inverter
+    manufacturer: ""       # Populated by auto-discovery
+    model: ""              # Populated by auto-discovery
+    serial: ""             # Populated by auto-discovery
+    firmware_version: ""   # Populated by auto-discovery
+    location_id: ""        # Assigned Standort (Location.id), empty = unassigned
+
+# Locations / Standorte (optional -- assign inverters to physical sites)
+# Coordinates may be left blank and fed live via MQTT (mqtt_coords: true);
+# publish {"lat": 48.137, "lon": 11.575} to pv-inverter-master/location/<id>/position.
+locations: []
+#   - id: "home00000001"
+#     name: "Zuhause"
+#     lat: 48.137154
+#     lon: 11.576124
+#     street: "Marienplatz 1"
+#     postal_code: "80331"
+#     city: "Muenchen"
+#     country: "Deutschland"
+#     image_filename: ""
+#     mqtt_coords: false
+
+# Proxy server settings
+proxy:
+  host: "0.0.0.0"        # Bind address (0.0.0.0 = all interfaces)
+  port: 502              # Modbus TCP port for Venus OS
+  poll_interval: 1.0     # Seconds between inverter polls
+  staleness_timeout: 30.0  # Seconds before cache is considered stale
+
+# Venus OS write-path hysteresis. Throttle-DOWN writes are always
+# forwarded immediately. RELEASE-UP writes are gated to dampen Venus
+# OS oscillation against the SE30K's ~15s settling time. Set
+# hysteresis_pct to 0 to disable the filter (forward every write
+# unchanged).
+control:
+  hysteresis_pct: 3.0          # min Δ% for release-up
+  min_hold_after_down_s: 15.0  # min seconds since last forwarded write
+  near_full_pct: 95.0          # release ≥ this always forwarded
+
+# Venus OS MQTT connection (optional)
+venus:
+  host: ""                # Venus OS IP (empty = MQTT disabled, proxy runs standalone)
+  port: 1883              # MQTT standard port
+  portal_id: ""           # Leave empty for auto-discovery via N/+/system/0/Serial
+
+# Night mode (inverter offline/sleeping)
+night_mode:
+  threshold_seconds: 300.0  # Seconds of failure before entering night mode (5 min)
+
+# Webapp settings
+webapp:
+  port: 80  # HTTP port for web interface
+
+# MQTT Publishing (optional -- publishes inverter data to external MQTT broker)
+mqtt_publish:
+  enabled: false             # Set true to activate MQTT publishing
+  host: "mqtt.example"  # Broker hostname or IP
+  port: 1883                 # Broker port
+  topic_prefix: "pv-inverter-master"    # MQTT topic prefix
+  interval_s: 5              # Publish interval in seconds
+  client_id: "pv-proxy-pub"  # MQTT client identifier
+
+# Logging
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
