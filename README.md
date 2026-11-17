@@ -113,20 +113,49 @@ systemctl stop pv-inverter-master
 
 ## Tech Stack
 
-- **Python 3.12**, pymodbus 3.8+, aiohttp, paho-mqtt, structlog, PyYAML, zeroconf
-- **Frontend**: Vanilla JS, CSS3 (zero dependencies, no build step)
+- **Python 3.12**, pymodbus, aiohttp, aiomqtt, structlog, PyYAML, zeroconf, hoymiles-wifi (see `pyproject.toml`)
+- **Frontend**: Vanilla JS, CSS3, no build step; bundles [Leaflet 1.9.4](THIRD-PARTY-NOTICES.md) for the map
 - **Deployment**: systemd service on Debian/Ubuntu (LXC recommended)
 
 ## Development
 
 ```bash
 git clone https://github.com/meintechblog/pv-inverter-master-oss.git
-cd pv-inverter-master
+cd pv-inverter-master-oss
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 ```
 
+## Security notes
+
+- **No login on the web interface.** The dashboard and its API listen on all network interfaces (port 80) without authentication, and the SunSpec endpoint listens on port 502. Anyone who can reach the host can view data and change settings, including inverter power limits. Run it only in a trusted network and never expose it to the internet.
+- **Nightly auto-update is on by default and unsigned.** The updater installs new GitHub releases unattended; release signatures are not verified. To turn this off, set `auto_install: false` (or `enabled: false` to disable the updater completely) in the `update:` section of `/etc/pv-inverter-master/config.yaml`.
+- To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+## Safety notice
+
+- This software actively controls the power output of your inverters.
+- Requirements of the inverter manufacturer and your grid operator remain in force.
+- Frequent write operations can wear the inverter's non-volatile memory; write rates are limited, but you use the software at your own risk.
+- The software does not guarantee that requirements of grid operators or direct marketers are met.
+
+## External services
+
+The web interface or the service contacts these third-party services; their terms apply:
+
+- Map tiles: CARTO, Esri
+- Weather radar: RainViewer
+- Address search: Nominatim (OpenStreetMap)
+- Country borders: jsDelivr / GitHub (johan/world.geo.json)
+- Update check: GitHub API
+
+## Trademarks
+
+Not affiliated with or endorsed by Victron Energy, Fronius, SolarEdge, SMA, SENEC, Hoymiles, Sungrow, Shelly, Loxone or the SunSpec Alliance. Names are trademarks of their owners and are used only to describe compatibility. The manufacturer string "Fronius" is written to the SunSpec common block solely for interoperability with Venus OS.
+
 ## License
 
-[Energy Community License (ECL-1.0)](LICENSE) — Free to use, modify, and redistribute. Commercial resale of the software itself is not permitted. See [LICENSE](LICENSE) for details.
+Source-available under the [Energy Community License (ECL-1.0)](LICENSE) — free to use, modify, and redistribute. Commercial resale of the software itself is not permitted; commercial redistribution, preinstalled hardware and paid hosting above infrastructure cost are restricted, see [LICENSE](LICENSE) for details.
+
+Leaflet 1.9.4 (BSD-2-Clause) is bundled under its own licence; ECL-1.0 does not apply to it. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

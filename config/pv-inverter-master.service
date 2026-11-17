@@ -16,9 +16,9 @@ TimeoutStopSec=90
 KillMode=mixed
 User=pv-proxy
 Group=pv-proxy
-# Optional GitHub auth for the update-check poll. Since the repo went
-# private (2026-06-04) the /releases/latest API 404s without auth, so the
-# scheduler needs a token. Drop `GITHUB_TOKEN=ghp_...` into this file
+# Optional GitHub auth for the update-check poll, for private forks: there
+# the /releases/latest API 404s without auth, so the scheduler needs a
+# token. Drop `GITHUB_TOKEN=ghp_...` into this file
 # (chmod 600, owned by pv-proxy) — the leading `-` makes it optional so a
 # box without the file still boots. Secret stays OUT of git (the file is
 # created box-side, not shipped). NOTE: the actual code download

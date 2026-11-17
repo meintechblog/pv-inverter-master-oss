@@ -105,10 +105,9 @@ class GithubReleaseClient:
     ) -> None:
         self._session = session
         self._state_file = state_file
-        # Optional GitHub auth token. Once the upstream repo went private
-        # (USP protection, 2026-06-04), the /releases/latest endpoint 404s
-        # for unauthenticated callers, so the poll needs a Bearer token to
-        # keep detecting releases. Resolved at construction (NOT as a default
+        # Optional GitHub auth token for private forks: there the
+        # /releases/latest endpoint 404s for unauthenticated callers, so the
+        # poll needs a Bearer token to keep detecting releases. Resolved at construction (NOT as a default
         # arg, which would freeze the env value at import time): explicit
         # ``token`` wins, else the GITHUB_TOKEN env var (set via the systemd
         # unit's EnvironmentFile on the LXC), else None = legacy public
@@ -227,8 +226,8 @@ class GithubReleaseClient:
         }
         # Authenticate when a token is configured. GitHub accepts
         # ``Authorization: Bearer <token>`` for both classic and
-        # fine-grained PATs; required now that the repo is private (a
-        # private /releases/latest 404s without auth). Absent -> no header.
+        # fine-grained PATs; needed for private forks (a private
+        # /releases/latest 404s without auth). Absent -> no header.
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         if self._etag:

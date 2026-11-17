@@ -589,10 +589,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Auto-update check now authenticates when the repo is private.** The
-  upstream repo was switched to private (2026-06-04, USP protection), which
-  makes the unauthenticated `GET /releases/latest` poll return 404 and
-  silently stop detecting releases. `GithubReleaseClient` now sends
+- **Auto-update check can authenticate with an optional token.** For a
+  private fork, the unauthenticated `GET /releases/latest` poll returns 404
+  and silently stops detecting releases. `GithubReleaseClient` now sends
   `Authorization: Bearer <token>` when a token is configured — via an
   explicit constructor arg or the `GITHUB_TOKEN` env var (resolved at
   construction, not as an import-time default). Absent token = unchanged

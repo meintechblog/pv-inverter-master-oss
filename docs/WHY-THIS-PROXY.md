@@ -87,11 +87,11 @@ From [Victron Community forums](https://community.victronenergy.com/t/help-neede
 
 ## Conclusion
 
-The proxy is the **safer, more feature-rich option** for the SE30K:
+The proxy is the **more feature-rich option** for the SE30K:
 
 1. **Zero inverter reconfiguration** — SE30K stays on factory settings (port 1502, unit ID 1)
 2. **Monitoring platform preserved** — SolarEdge cloud monitoring continues working
-3. **Guaranteed compatibility** — Tested and verified, unlike untested direct SE30K path
+3. **Tested compatibility (SE30K, tested setup)** — unlike the untested direct SE30K path
 4. **Additional features** — Web dashboard, register viewer, night mode, reconnection
 5. **Power control via standard SunSpec** — Model 123 translated to EDPC, cleaner integration
 
