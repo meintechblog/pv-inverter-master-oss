@@ -12,6 +12,8 @@ from pv_inverter_master.config import Config
 from pv_inverter_master.updater.progress import start_broadcaster, stop_broadcaster
 from pv_inverter_master.updater.security import csrf_middleware
 
+from .origin_guard import origin_guard_middleware
+
 from .routes_config import (
     config_export_handler,
     config_get_handler,
@@ -109,14 +111,19 @@ async def create_webapp(
 
     Returns an AppRunner (caller manages site creation and lifecycle).
     """
-    # Phase 46 D-07..D-09, D-41: csrf_middleware MUST be first so it runs
-    # before any body parsing and can reject CSRF violations with an audit
-    # trail regardless of the downstream handler's guard pipeline.
+    # Middleware order: origin_guard_middleware first, then csrf_middleware.
+    # Both run before any body parsing. The origin guard rejects cross-site
+    # writes to any /api/ route with 403 (no audit line); same-origin
+    # requests then still pass the double-submit CSRF check on
+    # /api/update/*, whose rejections keep their audit trail.
     # 32 MB body cap (aiohttp default is 1 MB): Standort-import ZIPs carry the
     # site photo (≤3 MB) plus all its inverters, and config-import bodies grow
     # with many devices. Without this, a Standort-with-image upload is rejected
     # with HTTP 413 ("Request Entity Too Large") before the handler runs.
-    app = web.Application(middlewares=[csrf_middleware], client_max_size=32 * 1024 * 1024)
+    app = web.Application(
+        middlewares=[origin_guard_middleware, csrf_middleware],
+        client_max_size=32 * 1024 * 1024,
+    )
     app["app_ctx"] = app_ctx
     app["config"] = config
     app["config_path"] = config_path

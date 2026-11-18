@@ -17,5 +17,6 @@ Only the latest release receives security fixes.
 ## Known design limits
 
 See the "Security notes" section in the [README](README.md): the web
-interface has no login and must only be run in a trusted network, and the
-nightly auto-update is enabled by default without signature verification.
+interface has no login and must only be run in a trusted network.
+Auto-update is off by default; if you enable it, releases are installed
+unattended as root without signature verification.

@@ -990,7 +990,7 @@ async def test_update_config_get_returns_four_fields(webapp_client_with_cfg):
     }
     assert data["github_repo"] == "meintechblog/pv-inverter-master-oss"
     assert data["check_interval_hours"] == 24
-    assert data["auto_install"] is True
+    assert data["auto_install"] is False
     assert data["enabled"] is True
 
 
@@ -1073,7 +1073,7 @@ async def test_update_config_patch_accepts_single_field(
     assert data["check_interval_hours"] == 6
     # Unspecified fields fall back to defaults.
     assert data["github_repo"] == "meintechblog/pv-inverter-master-oss"
-    assert data["auto_install"] is True
+    assert data["auto_install"] is False
 
     # Verify the file actually moved.
     import yaml as _yaml

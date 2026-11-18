@@ -53,7 +53,7 @@ class UpdateConfig:
 
     github_repo: str = "meintechblog/pv-inverter-master-oss"
     check_interval_hours: int = 24
-    auto_install: bool = True   # nightly unattended auto-update ON by default
+    auto_install: bool = False  # nightly unattended auto-update OFF by default (opt-in)
     enabled: bool = True
 
 

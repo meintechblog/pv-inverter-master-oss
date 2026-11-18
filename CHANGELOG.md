@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Cross-site writes to the API are rejected (`webapp/origin_guard.py`).**
+  Mutating `/api/` requests get 403 when `Sec-Fetch-Site` is `cross-site` or
+  `Origin` does not match `Host`, and 415 for `text/plain` or form-encoded
+  bodies (multipart only for image uploads). JSON requests without `Origin`
+  (scripts, curl) keep working; a reverse proxy must forward the original
+  `Host` header. DNS rebinding is not covered yet.
+- **Auto-update is now opt-in.** `update.auto_install` defaults to `false`;
+  installations that want nightly unattended updates must set it to `true`
+  explicitly.
+
 ### Changed
 
 - **One Modbus gateway per inverter host (`modbus_gateway.py`).** Every Modbus

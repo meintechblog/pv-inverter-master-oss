@@ -84,5 +84,5 @@ async def test_skips_when_no_target_sha(tmp_path):
     wt.assert_not_called()
 
 
-def test_auto_install_defaults_on():
-    assert UpdateConfig().auto_install is True
+def test_auto_install_defaults_off():
+    assert UpdateConfig().auto_install is False

@@ -129,8 +129,9 @@ pytest
 
 ## Security notes
 
-- **No login on the web interface.** The dashboard and its API listen on all network interfaces (port 80) without authentication, and the SunSpec endpoint listens on port 502. Anyone who can reach the host can view data and change settings, including inverter power limits. Run it only in a trusted network and never expose it to the internet.
-- **Nightly auto-update is on by default and unsigned.** The updater installs new GitHub releases unattended; release signatures are not verified. To turn this off, set `auto_install: false` (or `enabled: false` to disable the updater completely) in the `update:` section of `/etc/pv-inverter-master/config.yaml`.
+- **No login on the web interface.** The dashboard and its API listen on all network interfaces (port 80 by default) without authentication, and the SunSpec endpoint listens on port 502 by default. Anyone who can reach the host can view data and change settings, including inverter power limits. Run it only in a trusted network and never expose it to the internet.
+- **Auto-update is off by default.** If you enable it (`auto_install: true` in the `update:` section of `/etc/pv-inverter-master/config.yaml`), new GitHub releases are installed unattended every night as root without signature verification. `enabled: false` disables the updater completely.
+- **Cross-site writes are rejected.** Changes through the API are refused when a browser reports another site as origin, and request bodies must use an explicit content type such as JSON. Scripts without an `Origin` header that send JSON keep working. Behind a reverse proxy, forward the original `Host` header. DNS rebinding is not yet blocked (planned for a later version); this is another reason to run it only in a trusted network.
 - To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Safety notice

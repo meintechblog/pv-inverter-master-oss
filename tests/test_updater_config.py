@@ -36,7 +36,7 @@ def test_default_values_match_d04():
     uc = UpdateConfig()
     assert uc.github_repo == "meintechblog/pv-inverter-master-oss"
     assert uc.check_interval_hours == 24
-    assert uc.auto_install is True
+    assert uc.auto_install is False
 
 
 def test_dataclass_has_exactly_four_fields():
@@ -102,7 +102,7 @@ def test_load_update_config_partial_section_fills_defaults(tmp_path: Path):
     assert uc.check_interval_hours == 6
     # other fields fall back to defaults
     assert uc.github_repo == "meintechblog/pv-inverter-master-oss"
-    assert uc.auto_install is True
+    assert uc.auto_install is False
 
 
 def test_load_update_config_full_section_roundtrip(tmp_path: Path):
@@ -147,7 +147,7 @@ def test_load_update_config_rejects_invalid_types_and_uses_defaults(
     uc = load_update_config(str(config_path))
     assert uc.github_repo == "meintechblog/pv-inverter-master-oss"
     assert uc.check_interval_hours == 24
-    assert uc.auto_install is True
+    assert uc.auto_install is False
 
 
 # ---------------------------------------------------------------------------
